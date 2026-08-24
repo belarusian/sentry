@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from pathlib import Path
 
 from sentry.sentrylog import LogEntry, SentryLog
 

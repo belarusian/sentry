@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 
 from sentry.relaunch import (
     STANDARD_ENDPOINT_ENV,
-    RelaunchResult,
     Relauncher,
+    RelaunchResult,
 )
 
 START_1 = "========== CYCLE 1  21:02:33Z ==========\n"
