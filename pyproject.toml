@@ -1,0 +1,15 @@
+[project]
+name = "sentry"
+version = "0.1.0"
+description = "A deterministic, stdlib-only Python supervisor for pipeline rescue."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+ignore_missing_imports = true
