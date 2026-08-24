@@ -4,9 +4,12 @@ Watches one project directory (a path like ``/home/sasha/AI/<name>`` containing
 ``cycles.out``, the gate log, and the ``run-cycles.sh`` driver) and reports
 whether a rescue action is warranted.
 
-Marker grammar (tolerant parsing, see TICKET-005):
+Marker grammar (tolerant parsing, see TICKET-005/006):
   * start: ``========== CYCLE <n>  <date> ==========``  (``=`` framing, any spacing)
   * done:  ``========== CYCLE <n> done ==========`
+  * an OPTIONAL project-name token may precede ``CYCLE`` (e.g.
+    ``========== FOURSEER CYCLE <n> ... ==========``, see TICKET-006) so the
+    same sentinel works across all four pipelines.
   * header lines beginning with ``#`` (e.g. ``# endpoint: ...``) are ignored.
 """
 
@@ -17,10 +20,14 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# A done marker: ``=+ CYCLE <n> done`` (``done`` immediately after the number).
-_DONE_RE = re.compile(r"^=+\s*CYCLE\s+(\d+)\s+done\b")
-# A start marker: ``=+ CYCLE <n>`` (number not followed by ``done``).
-_START_RE = re.compile(r"^=+\s*CYCLE\s+(\d+)\b")
+# Optional project-name token before ``CYCLE`` (e.g. ``FOURSEER CYCLE 7``).
+# The bare ``CYCLE <n>`` dialect has no prefix; the token is optional so both
+# dialects parse with the same regexes (TICKET-006).
+_PREFIX = r"(?:[A-Za-z0-9_-]+\s+)?"
+# A done marker: ``=+ [PREFIX] CYCLE <n> done`` (``done`` after the number).
+_DONE_RE = re.compile(r"^=+\s*" + _PREFIX + r"CYCLE\s+(\d+)\s+done\b")
+# A start marker: ``=+ [PREFIX] CYCLE <n>`` (number not followed by ``done``).
+_START_RE = re.compile(r"^=+\s*" + _PREFIX + r"CYCLE\s+(\d+)\b")
 # A gate-log cycle heading: ``## Cycle <n> ...``.
 _GATE_CYCLE_RE = re.compile(r"^##\s+Cycle\s+(\d+)\b")
 
@@ -124,6 +131,10 @@ class Sentinel:
                 started.add(int(start_match.group(1)))
         return started, done
 
+    def parse_cycles(self) -> tuple[set[int], set[int]]:
+        """Public accessor: ``(started, done)`` cycle-number sets."""
+        return self._parse_cycles()
+
     def get_in_flight_cycles(self) -> list[int]:
         """Cycles with a start marker but no done marker, ascending."""
         started, done = self._parse_cycles()
@@ -136,20 +147,25 @@ class Sentinel:
 
     # -- gate log -----------------------------------------------------------
 
-    def has_gate_block(self, cycle: int) -> bool:
-        """True when the gate log has a non-pending ``## Cycle <n>`` block."""
+    def gate_block_cycles(self) -> set[int]:
+        """All cycle numbers with a non-pending ``## Cycle <n>`` gate block."""
         path = self.gate_log_path
         if path is None or not path.exists():
-            return False
+            return set()
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            return False
+            return set()
+        blocks: set[int] = set()
         for line in text.splitlines():
             match = _GATE_CYCLE_RE.match(line.strip())
-            if match and int(match.group(1)) == cycle and "pending" not in line.lower():
-                return True
-        return False
+            if match and "pending" not in line.lower():
+                blocks.add(int(match.group(1)))
+        return blocks
+
+    def has_gate_block(self, cycle: int) -> bool:
+        """True when the gate log has a non-pending ``## Cycle <n>`` block."""
+        return cycle in self.gate_block_cycles()
 
     # -- process liveness ---------------------------------------------------
 
