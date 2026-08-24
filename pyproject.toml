@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "A deterministic, stdlib-only Python supervisor for pipeline rescue."
 requires-python = ">=3.10"
 
+[tool.setuptools]
+packages = ["sentry"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
