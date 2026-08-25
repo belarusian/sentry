@@ -126,6 +126,37 @@ def test_probe_sockets_ignores_local_listen(tmp_path: Path) -> None:
         assert monitor.any_socket_live() is False
 
 
+def test_probe_sockets_ignores_endpoint_in_local_column(tmp_path: Path) -> None:
+    """TICKET-023: a host:port token in the *local* address column (not the
+    peer/destination column) must NOT count as a live endpoint."""
+    monitor = _make_monitor(tmp_path)
+    # Local bind is the endpoint token; the peer is an unrelated host.
+    ss_output = (
+        "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\n"
+        "ESTAB  0      0      192.168.1.157:8080  10.0.0.5:443 "
+        'users:(("python3",pid=457311,fd=3))\n'
+    )
+    with patch.object(monitor, "_run_ss", return_value=ss_output):
+        result = monitor.probe_sockets()
+        assert result["192.168.1.157:8080"] is False
+        assert monitor.any_socket_live() is False
+
+
+def test_probe_sockets_ignores_endpoint_in_process_path(tmp_path: Path) -> None:
+    """TICKET-023: a host:port token in the process/fd column must NOT count
+    as a live endpoint when the peer column is a different host."""
+    monitor = _make_monitor(tmp_path)
+    ss_output = (
+        "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\n"
+        "ESTAB  0      0      172.20.190.185:60230  10.0.0.5:443 "
+        'users:(("python3",pid=457311,fd=3)) 192.168.1.157:8080\n'
+    )
+    with patch.object(monitor, "_run_ss", return_value=ss_output):
+        result = monitor.probe_sockets()
+        assert result["192.168.1.157:8080"] is False
+        assert monitor.any_socket_live() is False
+
+
 def test_probe_sockets_dead_when_no_output(tmp_path: Path) -> None:
     monitor = _make_monitor(tmp_path)
     with patch.object(monitor, "_run_ss", return_value=""):
@@ -263,11 +294,50 @@ def test_handle_stall_not_stalled_logs_probe(tmp_path: Path) -> None:
     assert "stall.probe" in events
 
 
-def test_handle_stall_waits_when_socket_live(tmp_path: Path) -> None:
+def test_handle_stall_bare_estab_no_movement_kills(tmp_path: Path) -> None:
+    """TICKET-022: a hung-but-ESTAB socket with no progress must NOT WAIT;
+    it falls through to the KILL branch (crash detector, not stall detector)."""
     monitor = _make_monitor(tmp_path)
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
+        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    assert decision.pid == 111
+    entries = monitor.log.read_all()
+    kill_entries = [e for e in entries if e.event_type == "stall.kill"]
+    assert len(kill_entries) == 1
+    assert kill_entries[0].payload["pid"] == 111
+
+
+def test_handle_stall_bare_estab_no_movement_no_pid_is_noop(tmp_path: Path) -> None:
+    """TICKET-022: bare ESTAB + no progress + no inner pid -> safe no-op
+    (never a WAIT on the socket alone)."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=True),
+        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "find_inner_pid", return_value=None),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "none"
+    mock_kill.assert_not_called()
+
+
+def test_handle_stall_estab_with_growth_waits(tmp_path: Path) -> None:
+    """TICKET-022: ESTAB *corroborated* by a fresh movement signal (trajectory
+    growing) is a legitimate WAIT."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=True),
+        patch.object(monitor, "trajectory_growing", return_value=True),
     ):
         decision = monitor.handle_stall()
     assert decision.action == "wait"
