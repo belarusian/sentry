@@ -105,9 +105,12 @@ def test_probe_sockets_live_estab_to_remote_endpoint(tmp_path: Path) -> None:
     )
     with patch.object(monitor, "_run_ss", return_value=ss_output):
         result = monitor.probe_sockets()
+        # any_socket_live() re-runs the probe; it MUST run while the mock
+        # is active, otherwise the real `ss -tnp` runs and the result
+        # depends on ambient machine state (TICKET-016).
+        assert monitor.any_socket_live() is True
     assert result["192.168.1.157:8080"] is True
     assert result["192.168.1.161:8081"] is False
-    assert monitor.any_socket_live() is True
 
 
 def test_probe_sockets_ignores_local_listen(tmp_path: Path) -> None:
