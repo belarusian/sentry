@@ -104,9 +104,11 @@ def test_check_stall_kill_exit_1(tmp_path, capsys):
 
 
 def test_check_stall_wait_exit_0(tmp_path, capsys):
+    """WAIT requires the corroborating movement signal (trajectory growing),
+    not a bare ESTAB socket (TICKET-022)."""
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     cli = SentryCLI(tmp_path)
-    cli.monitor = _mock_monitor(stalled=True, socket_live=True)
+    cli.monitor = _mock_monitor(stalled=True, socket_live=True, growing=True)
     with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
          patch.object(cli.sentinel, "detect_driver_death",
                       return_value=DetectionResult(False, reason="none")), \
@@ -116,6 +118,22 @@ def test_check_stall_wait_exit_0(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == EXIT_OK
     assert "stall: wait" in out
+
+
+def test_check_stall_bare_estab_kills_exit_1(tmp_path, capsys):
+    """TICKET-022: a hung-but-ESTAB socket with no progress must KILL, not WAIT."""
+    _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
+    cli = SentryCLI(tmp_path)
+    cli.monitor = _mock_monitor(stalled=True, socket_live=True, growing=False, inner_pid=1234)
+    with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
+         patch.object(cli.sentinel, "detect_driver_death",
+                      return_value=DetectionResult(False, reason="none")), \
+         patch.object(cli.sentinel, "detect_wall_kill_no_merge",
+                      return_value=DetectionResult(False, reason="none")):
+        code = cli.run_check()
+    out = capsys.readouterr().out
+    assert code == EXIT_ACTION
+    assert "stall: kill" in out
 
 
 def test_check_writes_nothing_under_watched_project(tmp_path):

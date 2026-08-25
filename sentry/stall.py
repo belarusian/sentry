@@ -18,11 +18,20 @@ no recorded PID; it is located by pattern-matching ``/proc`` for the spoke
 marker (``cycle-implementation.py``). The driver (``run-cycles`` /
 ``run*.py``) is NEVER a candidate and is re-checked before any kill.
 
-Socket probe (TICKET-015): "socket live" means an outbound ``ESTAB``
-connection to a *remote* endpoint host:port (e.g. ``192.168.1.157:8080``),
-not a local ``LISTEN`` on the same port. Local ``LISTEN`` lines are ignored.
-An ``ESTAB`` socket is a *crash* detector, not a *stall* detector (a hung
-LLM call stays ``ESTAB``), so the decision also weighs trajectory growth.
+Socket probe (TICKET-015 / TICKET-022 / TICKET-023): "socket live" means
+an outbound ``ESTAB`` connection whose *peer* (destination) column is a
+*remote* endpoint host:port (e.g. ``192.168.1.157:8080``). The match is
+scoped to the peer column of the ``ss -tnp`` line, not a whole-line
+substring, so a host:port token in the *local* address column or a process
+path never counts as live. Local ``LISTEN`` lines are ignored.
+
+Crash-vs-stall (TICKET-022): an ``ESTAB`` socket is a *crash* detector
+(connection torn down), not a *stall* detector (connection alive but no
+progress) — a hung LLM call stays ``ESTAB``. The socket probe therefore
+NEVER triggers WAIT on its own; the WAIT decision is gated on the
+trajectory / pass-cadence movement signal. A bare ``ESTAB`` with no
+progress falls through to the KILL branch so a hung-but-ESTAB connection
+cannot block a KILL forever.
 
 Trajectory growth (TICKET-014): trajectories are written once at pass end,
 so "growing" is a weak WAIT signal; it is sampled twice (size + mtime) and
@@ -53,6 +62,13 @@ _DRIVER_PATTERNS = (
 
 # Marker for the inner spoke (the LLM-spawned grandchild, TICKET-013).
 _INNER_SPOKE_MARKER = "cycle-implementation.py"
+
+# Column index of the peer (destination) field in ``ss -tnp`` output.
+# The line shape is: State Recv-Q Send-Q Local Peer [Process], so the
+# peer/destination is the 5th column (index 4). Matching this column --
+# not the whole line -- is what keeps a host:port token in the *local*
+# address column or a process path from false-positiving (TICKET-023).
+_PEER_COL = 4
 
 
 @dataclass
@@ -287,8 +303,12 @@ class StallMonitor:
         """Map each endpoint to whether an outbound ESTAB connection is live.
 
         A line is a live endpoint connection when its state field is ``ESTAB``
-        AND the line contains the endpoint's ``host:port`` token. Local
-        ``LISTEN`` lines (state != ESTAB) are ignored (TICKET-015).
+        AND its *peer* (destination) column equals the endpoint's
+        ``host:port`` token. The match is scoped to the peer column
+        (``_PEER_COL``), not a whole-line substring, so a host:port token in
+        the *local* address column or a process path never counts as live
+        (TICKET-023). Local ``LISTEN`` lines (state != ESTAB) are ignored
+        (TICKET-015).
         """
         output = self._run_ss()
         result = {endpoint: False for endpoint in self.endpoints}
@@ -296,8 +316,11 @@ class StallMonitor:
             fields = line.split()
             if not fields or fields[0] != "ESTAB":
                 continue
+            if len(fields) <= _PEER_COL:
+                continue
+            peer = fields[_PEER_COL]
             for endpoint in self.endpoints:
-                if endpoint in line:
+                if peer == endpoint:
                     result[endpoint] = True
         return result
 
@@ -482,26 +505,22 @@ class StallMonitor:
                 evidence=dict(result.evidence),
                 logged=True,
             )
-        if self.any_socket_live():
-            self.log.append(
-                "stall.wait",
-                {
-                    "reason": "socket live",
-                    "last_movement": result.last_movement,
-                    "age_seconds": result.age_seconds,
-                },
-            )
-            return StallDecision(
-                action="wait",
-                reason="socket live",
-                evidence=dict(result.evidence),
-                logged=True,
-            )
-        if self.trajectory_growing():
+        # TICKET-022: an ESTAB socket is a *crash* detector, not a *stall*
+        # detector (a hung LLM call stays ESTAB). The socket probe therefore
+        # never triggers WAIT on its own; WAIT is gated on the corroborating
+        # movement signal (trajectory growth). A bare ESTAB with no progress
+        # falls through to the KILL branch so a hung-but-ESTAB connection
+        # cannot block a KILL forever.
+        socket_live = self.any_socket_live()
+        growing = self.trajectory_growing()
+        evidence = dict(result.evidence)
+        evidence["socket_live"] = socket_live
+        if growing:
             self.log.append(
                 "stall.wait",
                 {
                     "reason": "trajectory growing",
+                    "socket_live": socket_live,
                     "last_movement": result.last_movement,
                     "age_seconds": result.age_seconds,
                 },
@@ -509,7 +528,7 @@ class StallMonitor:
             return StallDecision(
                 action="wait",
                 reason="trajectory growing",
-                evidence=dict(result.evidence),
+                evidence=evidence,
                 logged=True,
             )
         pid = self.find_inner_pid()
