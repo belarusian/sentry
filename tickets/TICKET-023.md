@@ -27,3 +27,6 @@
 - Scope the match to the peer/destination field: parse the `ss` line into columns and compare the *peer* column (4th field, index 3) against each endpoint `host:port`, rather than `endpoint in line`. Keep the `ESTAB` state guard.
 - Add a regression test: an `ESTAB` line whose endpoint token appears only in the local-address column (or a process path) must yield `result[endpoint] is False`, while the same token in the peer column yields True.
 - Note: the endpoint host:port list is already a constructor parameter (`endpoints`, stall.py:136) and is wired through `self.endpoints` into `probe_sockets` — that part of the target is satisfied; only the field scoping is in scope here.
+
+---
+GitHub issue: https://github.com/belarusian/sentry/issues/27

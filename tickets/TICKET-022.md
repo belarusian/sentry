@@ -29,3 +29,6 @@
 - Do not let "socket ESTAB" alone trigger WAIT. Require a corroborating movement/growth signal so a hung-but-ESTAB connection does not block KILL — e.g. WAIT only when the socket is live *and* a movement signal is fresh (trajectory growth per TICKET-014, or the socket was established within the stall window). A bare ESTAB with no movement should fall through to the KILL branch.
 - Apply the change to **both** `handle_stall` (stall.py:485-500) and `_stall_decision_readonly` (cli.py:74-75) together so `check` and `rescue` stay consistent.
 - Update `test_handle_stall_waits_when_socket_live` (test_stall.py:266) to assert the new semantics (bare ESTAB + no movement -> KILL, not WAIT), and add a case for ESTAB + fresh movement -> WAIT.
+
+---
+GitHub issue: https://github.com/belarusian/sentry/issues/26
