@@ -1,8 +1,11 @@
 [project]
 name = "sentry"
-version = "0.1.0"
+version = "0.2.0"
 description = "A deterministic, stdlib-only Python supervisor for pipeline rescue."
 requires-python = ">=3.10"
+
+[project.scripts]
+sentry = "sentry.cli:main"
 
 [tool.setuptools]
 packages = ["sentry"]
