@@ -218,6 +218,84 @@ def test_trajectory_growing_false_when_no_file(tmp_path: Path) -> None:
         assert monitor.trajectory_growing() is False
 
 
+# -- movement_recent_fine: two-sample append-only growth (TICKET-024/025) ---
+
+
+def _two_sample_sizes(monitor: StallMonitor, sizes_by_path: dict):
+    """Build a ``_sample_size`` side_effect that returns per-path first/second
+    sizes (a two-sample sequence) for the paths in ``sizes_by_path``."""
+    seqs = {path: iter(vals) for path, vals in sizes_by_path.items()}
+    return lambda path: next(seqs[path])
+
+
+def test_movement_recent_fine_true_when_gate_log_grows(tmp_path: Path) -> None:
+    """TICKET-025: an append-only gate log that grows between samples is a
+    genuine during-pass movement signal -> True."""
+    monitor = _make_monitor(tmp_path)
+    gate = tmp_path / "watched" / "ai" / "cycle-001-sentry-gate.md"
+    with (
+        patch.object(monitor, "_gate_log_path", return_value=gate),
+        patch.object(monitor, "_sample_size", side_effect=_two_sample_sizes(monitor, {gate: [100, 200]})),
+        patch.object(monitor, "_stat_mtime", return_value=BASE),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.movement_recent_fine() is True
+
+
+def test_movement_recent_fine_true_when_cycles_out_mtime_advances(tmp_path: Path) -> None:
+    """TICKET-025: cycles.out mtime advancing between samples -> True."""
+    monitor = _make_monitor(tmp_path)
+    cycles = tmp_path / "watched" / "cycles.out"
+    cycles.parent.mkdir(parents=True, exist_ok=True)
+    cycles.write_text("x")
+    mtimes = iter([BASE, BASE + 5])
+    with (
+        patch.object(monitor, "_gate_log_path", return_value=None),
+        patch.object(monitor, "_sample_size", return_value=100),
+        patch.object(monitor, "_stat_mtime", side_effect=lambda p: next(mtimes)),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.movement_recent_fine() is True
+
+
+def test_movement_recent_fine_false_when_flat(tmp_path: Path) -> None:
+    """TICKET-025: no append activity (size + mtime flat) -> False."""
+    monitor = _make_monitor(tmp_path)
+    gate = tmp_path / "watched" / "ai" / "cycle-001-sentry-gate.md"
+    with (
+        patch.object(monitor, "_gate_log_path", return_value=gate),
+        patch.object(monitor, "_sample_size", return_value=100),
+        patch.object(monitor, "_stat_mtime", return_value=BASE),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.movement_recent_fine() is False
+
+
+def test_movement_recent_fine_false_when_no_artifacts(tmp_path: Path) -> None:
+    """TICKET-025: no append-only artifact present -> False (nothing to sample)."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_gate_log_path", return_value=None),
+        patch.object(monitor, "_append_artifact_paths", return_value=[]),
+    ):
+        assert monitor.movement_recent_fine() is False
+
+
+def test_movement_recent_fine_ignores_frozen_trajectory(tmp_path: Path) -> None:
+    """TICKET-024: a frozen trajectory (written once at pass end) is NOT a
+    movement signal; only the append-only artifacts count."""
+    monitor = _make_monitor(tmp_path)
+    gate = tmp_path / "watched" / "ai" / "cycle-001-sentry-gate.md"
+    with (
+        patch.object(monitor, "_gate_log_path", return_value=gate),
+        patch.object(monitor, "_sample_size", return_value=100),
+        patch.object(monitor, "_stat_mtime", return_value=BASE),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        # The trajectory path is never consulted by the fine-grained signal.
+        assert monitor.movement_recent_fine() is False
+
+
 # -- find_inner_pid / kill_inner: inner only, never the driver --------------
 
 
@@ -301,7 +379,7 @@ def test_handle_stall_bare_estab_no_movement_kills(tmp_path: Path) -> None:
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
-        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -321,7 +399,7 @@ def test_handle_stall_bare_estab_no_movement_no_pid_is_noop(tmp_path: Path) -> N
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
-        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):
@@ -330,14 +408,15 @@ def test_handle_stall_bare_estab_no_movement_no_pid_is_noop(tmp_path: Path) -> N
     mock_kill.assert_not_called()
 
 
-def test_handle_stall_estab_with_growth_waits(tmp_path: Path) -> None:
-    """TICKET-022: ESTAB *corroborated* by a fresh movement signal (trajectory
-    growing) is a legitimate WAIT."""
+def test_handle_stall_estab_with_movement_waits(tmp_path: Path) -> None:
+    """TICKET-022/025: ESTAB *corroborated* by a fresh fine-grained movement
+    signal (an append-only artifact growing DURING the pass) is a legitimate
+    WAIT."""
     monitor = _make_monitor(tmp_path)
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
-        patch.object(monitor, "trajectory_growing", return_value=True),
+        patch.object(monitor, "movement_recent_fine", return_value=True),
     ):
         decision = monitor.handle_stall()
     assert decision.action == "wait"
@@ -345,12 +424,12 @@ def test_handle_stall_estab_with_growth_waits(tmp_path: Path) -> None:
     assert "stall.wait" in events
 
 
-def test_handle_stall_waits_when_trajectory_growing(tmp_path: Path) -> None:
+def test_handle_stall_waits_when_movement_recent(tmp_path: Path) -> None:
     monitor = _make_monitor(tmp_path)
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
-        patch.object(monitor, "trajectory_growing", return_value=True),
+        patch.object(monitor, "movement_recent_fine", return_value=True),
     ):
         decision = monitor.handle_stall()
     assert decision.action == "wait"
@@ -363,7 +442,7 @@ def test_handle_stall_kills_inner_and_logs_kill(tmp_path: Path) -> None:
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
-        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -381,7 +460,7 @@ def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
     with (
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
-        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):

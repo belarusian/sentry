@@ -71,14 +71,15 @@ class SentryCLI:
         result = monitor.detect_stall(now)
         if not result.stalled:
             return "none", result.reason
-        # TICKET-022: an ESTAB socket is a *crash* detector, not a *stall*
-        # detector (a hung LLM call stays ESTAB). The socket probe never
-        # triggers WAIT on its own; WAIT is gated on the corroborating
-        # movement signal (trajectory growth). A bare ESTAB with no progress
-        # falls through to the KILL branch. Mirrors StallMonitor.handle_stall.
+        # TICKET-022 / TICKET-027: an ESTAB socket is a *crash* detector, not
+        # a *stall* detector (a hung LLM call stays ESTAB). The socket probe
+        # never triggers WAIT on its own; WAIT is gated on the corroborating
+        # fine-grained movement signal (an append-only artifact growing DURING
+        # the pass, TICKET-024/025). A bare ESTAB with no movement falls
+        # through to the KILL branch. Mirrors StallMonitor.handle_stall.
         socket_live = monitor.any_socket_live()
-        if monitor.trajectory_growing():
-            return "wait", "trajectory growing"
+        if monitor.movement_recent_fine():
+            return "wait", "append-only artifact moving during pass"
         pid = monitor.find_inner_pid()
         if pid is None:
             return "none", "stalled but no inner pid found"

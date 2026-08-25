@@ -10,11 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from sentry.cli import EXIT_ACTION, EXIT_OK, EXIT_USAGE, SentryCLI, main
 from sentry.relaunch import RelaunchResult
 from sentry.sentinel import DetectionResult
 from sentry.sentrylog import SentryLog
-from sentry.stall import StallDecision, StallResult
+from sentry.stall import StallDecision, StallMonitor, StallResult
 
 START_1 = "========== CYCLE 1  21:02:33Z =========="
 DONE_1 = "========== CYCLE 1 done =========="
@@ -27,12 +29,12 @@ def _make_project(tmp_path: Path, cycles_text: str) -> Path:
     return tmp_path
 
 
-def _mock_monitor(stalled: bool = False, socket_live: bool = False, growing: bool = False,
+def _mock_monitor(stalled: bool = False, socket_live: bool = False, moving: bool = False,
                   inner_pid: int | None = None) -> MagicMock:
     m = MagicMock()
     m.detect_stall.return_value = StallResult(stalled=stalled, reason="x")
     m.any_socket_live.return_value = socket_live
-    m.trajectory_growing.return_value = growing
+    m.movement_recent_fine.return_value = moving
     m.find_inner_pid.return_value = inner_pid
     return m
 
@@ -91,7 +93,7 @@ def test_check_wall_kill_exit_1(tmp_path, capsys):
 def test_check_stall_kill_exit_1(tmp_path, capsys):
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     cli = SentryCLI(tmp_path)
-    cli.monitor = _mock_monitor(stalled=True, socket_live=False, growing=False, inner_pid=1234)
+    cli.monitor = _mock_monitor(stalled=True, socket_live=False, moving=False, inner_pid=1234)
     with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
          patch.object(cli.sentinel, "detect_driver_death",
                       return_value=DetectionResult(False, reason="none")), \
@@ -108,7 +110,7 @@ def test_check_stall_wait_exit_0(tmp_path, capsys):
     not a bare ESTAB socket (TICKET-022)."""
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     cli = SentryCLI(tmp_path)
-    cli.monitor = _mock_monitor(stalled=True, socket_live=True, growing=True)
+    cli.monitor = _mock_monitor(stalled=True, socket_live=True, moving=True)
     with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
          patch.object(cli.sentinel, "detect_driver_death",
                       return_value=DetectionResult(False, reason="none")), \
@@ -124,7 +126,7 @@ def test_check_stall_bare_estab_kills_exit_1(tmp_path, capsys):
     """TICKET-022: a hung-but-ESTAB socket with no progress must KILL, not WAIT."""
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     cli = SentryCLI(tmp_path)
-    cli.monitor = _mock_monitor(stalled=True, socket_live=True, growing=False, inner_pid=1234)
+    cli.monitor = _mock_monitor(stalled=True, socket_live=True, moving=False, inner_pid=1234)
     with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
          patch.object(cli.sentinel, "detect_driver_death",
                       return_value=DetectionResult(False, reason="none")), \
@@ -228,6 +230,48 @@ def test_rescue_apply_stall_kill_exit_1(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == EXIT_ACTION
     assert "stall: kill" in out
+
+
+# ---------------------------------------------------------------------------
+# check/rescue parity (TICKET-026): _stall_decision_readonly == handle_stall
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stalled,socket_live,moving,inner_pid,expected",
+    [
+        (False, False, False, None, "none"),
+        (True, True, True, None, "wait"),
+        (True, False, True, None, "wait"),
+        (True, True, False, 1234, "kill"),
+        (True, False, False, 1234, "kill"),
+        (True, True, False, None, "none"),
+        (True, False, False, None, "none"),
+    ],
+)
+def test_stall_decision_parity_readonly_matches_handle_stall(
+    tmp_path, stalled, socket_live, moving, inner_pid, expected
+):
+    """TICKET-026: for a given probe state, the read-only ``check`` decision
+    and the write ``rescue`` decision must agree. A real StallMonitor with
+    patched leaf probes lets both code paths run the real logic over the
+    same state."""
+    cli = SentryCLI(tmp_path)
+    monitor = StallMonitor(tmp_path, log=SentryLog(tmp_path / "parity.log"))
+    result = StallResult(
+        stalled=stalled, reason="stalled" if stalled else "not stalled"
+    )
+    with (
+        patch.object(monitor, "detect_stall", return_value=result),
+        patch.object(monitor, "any_socket_live", return_value=socket_live),
+        patch.object(monitor, "movement_recent_fine", return_value=moving),
+        patch.object(monitor, "find_inner_pid", return_value=inner_pid),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        readonly_action, _ = cli._stall_decision_readonly(monitor, now=1_000_000.0)
+        decision = monitor.handle_stall(now=1_000_000.0)
+    assert readonly_action == decision.action
+    assert readonly_action == expected
 
 
 # ---------------------------------------------------------------------------

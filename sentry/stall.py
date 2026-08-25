@@ -33,9 +33,20 @@ trajectory / pass-cadence movement signal. A bare ``ESTAB`` with no
 progress falls through to the KILL branch so a hung-but-ESTAB connection
 cannot block a KILL forever.
 
-Trajectory growth (TICKET-014): trajectories are written once at pass end,
-so "growing" is a weak WAIT signal; it is sampled twice (size + mtime) and
-combined with the socket probe rather than relied on alone.
+Movement signal (TICKET-014 / TICKET-024 / TICKET-025): trajectories are
+written ONCE, at full size, at the end of a pass (a single ``write_text``
+in ``save_trajectory._emit``), so the newest trajectory on disk is the
+previous pass's frozen output and never grows while a spoke is alive --
+the old two-sample ``trajectory_growing()`` WAIT gate was therefore
+structurally dead (TICKET-024). The WAIT gate is now gated on
+``movement_recent_fine()``: a two-sample (size + mtime) check of the
+append-only artifacts that actually grow DURING a pass -- the gate log
+(``ai/*gate*.md``) and ``cycles.out``. These are appended incrementally
+(each gate decision, each cycle marker), so a live, actively-working
+spoke moves them while a hung pass does not. The socket probe remains a
+crash detector only (TICKET-022): a bare ``ESTAB`` with no corroborating
+fine-grained movement still falls through to KILL, so a hung-but-ESTAB
+connection cannot block a KILL forever (TICKET-027).
 
 The watched project dir is READ-ONLY: the only write this module performs is
 to the :class:`~sentry.sentrylog.SentryLog` path (and the sentry repo).
@@ -391,6 +402,80 @@ class StallMonitor:
         )
         return size_grew or mtime_advanced
 
+    # -- fine-grained movement signal (TICKET-024 / TICKET-025) ------------
+
+    def _gate_log_path(self) -> Path | None:
+        """Locate the append-only gate log under the project dir. Overridable.
+
+        Mirrors :meth:`sentry.sentinel.Sentinel._find_gate_log`: the gate log
+        is an append-only ``ai/*gate*.md`` artifact that grows as gate
+        decisions are logged.
+        """
+        candidates: list[Path] = [
+            self.project_dir / "ai" / "cycle-001-sentry-gate.md"
+        ]
+        for pattern in ("ai/*gate*.md", "*gate*.md"):
+            candidates.extend(sorted(self.project_dir.glob(pattern)))
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    def _append_artifact_paths(self) -> list[Path]:
+        """Append-only artifacts that grow DURING a pass (gate log, cycles.out).
+
+        Unlike trajectories (written once at pass end), these are appended
+        incrementally, so their two-sample growth is a genuine "the spoke is
+        working right now" signal (TICKET-025).
+        """
+        paths: list[Path] = []
+        gate = self._gate_log_path()
+        if gate is not None:
+            paths.append(gate)
+        try:
+            if self.cycles_out_path.is_file():
+                paths.append(self.cycles_out_path)
+        except OSError:
+            pass
+        return paths
+
+    def movement_recent_fine(self, sample_interval: float = 0.5) -> bool:
+        """True when an append-only artifact moved between two samples.
+
+        Samples the size and mtime of each append-only artifact (gate log and
+        ``cycles.out``) twice with a short sleep between. Returns True when any
+        artifact's size grew OR its mtime advanced; False when there is no
+        append-only artifact. This is the WAIT-gate movement signal that
+        replaces the structurally-dead ``trajectory_growing()`` gate
+        (TICKET-024/025): it reflects append activity that happens DURING a
+        pass, which the coarse single-sample ``detect_stall`` (aged by
+        ``stall_seconds``) cannot see.
+        """
+        paths = self._append_artifact_paths()
+        if not paths:
+            return False
+        first = {
+            path: (self._sample_size(path), self._stat_mtime(path))
+            for path in paths
+        }
+        self._sleep(sample_interval)
+        for path in paths:
+            first_size, first_mtime = first[path]
+            second_size = self._sample_size(path)
+            second_mtime = self._stat_mtime(path)
+            if second_size > first_size:
+                return True
+            if (
+                first_mtime is not None
+                and second_mtime is not None
+                and second_mtime > first_mtime
+            ):
+                return True
+        return False
+
     # -- process scan / kill ------------------------------------------------
 
     def _scan_processes(self) -> list[tuple[int, str]]:
@@ -505,21 +590,23 @@ class StallMonitor:
                 evidence=dict(result.evidence),
                 logged=True,
             )
-        # TICKET-022: an ESTAB socket is a *crash* detector, not a *stall*
-        # detector (a hung LLM call stays ESTAB). The socket probe therefore
-        # never triggers WAIT on its own; WAIT is gated on the corroborating
-        # movement signal (trajectory growth). A bare ESTAB with no progress
-        # falls through to the KILL branch so a hung-but-ESTAB connection
-        # cannot block a KILL forever.
+        # TICKET-022 / TICKET-027: an ESTAB socket is a *crash* detector, not
+        # a *stall* detector (a hung LLM call stays ESTAB). The socket probe
+        # therefore never triggers WAIT on its own; WAIT is gated on the
+        # corroborating fine-grained movement signal (an append-only artifact
+        # growing DURING the pass, TICKET-024/025). A bare ESTAB with no
+        # movement falls through to the KILL branch so a hung-but-ESTAB
+        # connection cannot block a KILL forever.
         socket_live = self.any_socket_live()
-        growing = self.trajectory_growing()
+        moving = self.movement_recent_fine()
         evidence = dict(result.evidence)
         evidence["socket_live"] = socket_live
-        if growing:
+        evidence["movement_recent"] = moving
+        if moving:
             self.log.append(
                 "stall.wait",
                 {
-                    "reason": "trajectory growing",
+                    "reason": "append-only artifact moving during pass",
                     "socket_live": socket_live,
                     "last_movement": result.last_movement,
                     "age_seconds": result.age_seconds,
@@ -527,7 +614,7 @@ class StallMonitor:
             )
             return StallDecision(
                 action="wait",
-                reason="trajectory growing",
+                reason="append-only artifact moving during pass",
                 evidence=evidence,
                 logged=True,
             )
