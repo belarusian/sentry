@@ -1,0 +1,333 @@
+"""Tests for sentry.stall.StallMonitor (Cycle 4 stall handling).
+
+Uses ``patch.object(instance, 'method')`` throughout — never constructor-level
+patches. Writable paths come from the ``tmp_path`` fixture; the watched project
+dir is never written to.
+"""
+
+from __future__ import annotations
+
+import signal
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from sentry.sentrylog import SentryLog
+from sentry.stall import StallDecision, StallMonitor, StallResult
+
+# A fixed reference timestamp for deterministic boundary tests.
+BASE = 1_000_000.0
+
+
+def _make_monitor(tmp_path: Path, **kwargs) -> StallMonitor:
+    """Build a StallMonitor whose log lives under tmp_path (writable)."""
+    log = SentryLog(tmp_path / "stall.log")
+    return StallMonitor(
+        tmp_path / "watched",
+        log=log,
+        trajectories_dir=tmp_path / "trajectories",
+        git_dir=tmp_path / "proj",
+        **kwargs,
+    )
+
+
+def _patch_movement(monitor: StallMonitor, base: float):
+    """Patch all four movement signals to return a fixed ``base`` timestamp."""
+    return (
+        patch.object(monitor, "_git_commit_time", return_value=base),
+        patch.object(monitor, "_branch_ref_time", return_value=base),
+        patch.object(monitor, "_cycles_out_mtime", return_value=base),
+        patch.object(monitor, "_newest_trajectory_mtime", return_value=base),
+    )
+
+
+# -- detect_stall: 60-minute boundary (59 vs 61 min) ------------------------
+
+
+def test_detect_stall_not_stalled_at_59_min(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    p1, p2, p3, p4 = _patch_movement(monitor, BASE)
+    with p1, p2, p3, p4:
+        result = monitor.detect_stall(now=BASE + 59 * 60)
+    assert isinstance(result, StallResult)
+    assert result.stalled is False
+    assert result.last_movement == BASE
+    assert result.age_seconds == pytest.approx(59 * 60)
+
+
+def test_detect_stall_stalled_at_61_min(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    p1, p2, p3, p4 = _patch_movement(monitor, BASE)
+    with p1, p2, p3, p4:
+        result = monitor.detect_stall(now=BASE + 61 * 60)
+    assert result.stalled is True
+    assert result.age_seconds == pytest.approx(61 * 60)
+
+
+def test_detect_stall_uses_max_movement_signal(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    # Newest signal is the trajectory mtime (BASE + 1000).
+    with (
+        patch.object(monitor, "_git_commit_time", return_value=BASE),
+        patch.object(monitor, "_branch_ref_time", return_value=None),
+        patch.object(monitor, "_cycles_out_mtime", return_value=BASE + 500),
+        patch.object(monitor, "_newest_trajectory_mtime", return_value=BASE + 1000),
+    ):
+        result = monitor.detect_stall(now=BASE + 1000 + 61 * 60)
+    assert result.last_movement == BASE + 1000
+    assert result.stalled is True
+
+
+def test_detect_stall_no_movement_signal(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_git_commit_time", return_value=None),
+        patch.object(monitor, "_branch_ref_time", return_value=None),
+        patch.object(monitor, "_cycles_out_mtime", return_value=None),
+        patch.object(monitor, "_newest_trajectory_mtime", return_value=None),
+    ):
+        result = monitor.detect_stall(now=BASE + 10 * 3600)
+    assert result.stalled is False
+    assert result.last_movement is None
+    assert result.reason == "no movement signal"
+
+
+# -- probe_sockets: live / dead / local-LISTEN ignored ----------------------
+
+
+def test_probe_sockets_live_estab_to_remote_endpoint(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    ss_output = (
+        "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\n"
+        "ESTAB  0      0      172.20.190.185:60230  192.168.1.157:8080 "
+        'users:(("python3",pid=457311,fd=3))\n'
+    )
+    with patch.object(monitor, "_run_ss", return_value=ss_output):
+        result = monitor.probe_sockets()
+    assert result["192.168.1.157:8080"] is True
+    assert result["192.168.1.161:8081"] is False
+    assert monitor.any_socket_live() is True
+
+
+def test_probe_sockets_ignores_local_listen(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    # A local LISTEN on 0.0.0.0:8080 must NOT count as a live endpoint.
+    ss_output = (
+        "State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\n"
+        "LISTEN 0      5      0.0.0.0:8080           0.0.0.0:* \n"
+    )
+    with patch.object(monitor, "_run_ss", return_value=ss_output):
+        result = monitor.probe_sockets()
+        assert result["192.168.1.157:8080"] is False
+        assert monitor.any_socket_live() is False
+
+
+def test_probe_sockets_dead_when_no_output(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with patch.object(monitor, "_run_ss", return_value=""):
+        result = monitor.probe_sockets()
+        assert all(value is False for value in result.values())
+        assert monitor.any_socket_live() is False
+
+
+# -- trajectory_growing: two-sample size/mtime ------------------------------
+
+
+def test_trajectory_growing_true_when_size_grows(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    traj = tmp_path / "trajectories" / "trajectory_0001.json"
+    traj.parent.mkdir(parents=True, exist_ok=True)
+    traj.write_text("{}")
+    sizes = iter([100, 200])
+    with (
+        patch.object(monitor, "_newest_trajectory_path", return_value=traj),
+        patch.object(monitor, "_sample_size", side_effect=lambda p: next(sizes)),
+        patch.object(monitor, "_stat_mtime", return_value=BASE),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.trajectory_growing() is True
+
+
+def test_trajectory_growing_false_when_flat(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    traj = tmp_path / "trajectories" / "trajectory_0001.json"
+    traj.parent.mkdir(parents=True, exist_ok=True)
+    traj.write_text("{}")
+    with (
+        patch.object(monitor, "_newest_trajectory_path", return_value=traj),
+        patch.object(monitor, "_sample_size", return_value=100),
+        patch.object(monitor, "_stat_mtime", return_value=BASE),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.trajectory_growing() is False
+
+
+def test_trajectory_growing_true_when_mtime_advances(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    traj = tmp_path / "trajectories" / "trajectory_0001.json"
+    traj.parent.mkdir(parents=True, exist_ok=True)
+    traj.write_text("{}")
+    mtimes = iter([BASE, BASE + 5])
+    with (
+        patch.object(monitor, "_newest_trajectory_path", return_value=traj),
+        patch.object(monitor, "_sample_size", return_value=100),
+        patch.object(monitor, "_stat_mtime", side_effect=lambda p: next(mtimes)),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        assert monitor.trajectory_growing() is True
+
+
+def test_trajectory_growing_false_when_no_file(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with patch.object(monitor, "_newest_trajectory_path", return_value=None):
+        assert monitor.trajectory_growing() is False
+
+
+# -- find_inner_pid / kill_inner: inner only, never the driver --------------
+
+
+def test_find_inner_pid_returns_inner_not_driver(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    procs = [
+        (111, "python3 /home/sasha/Research/four/examples/spokes/cycle-implementation.py --cycle 4"),
+        (222, "bash /home/sasha/AI/sentry/run-cycles-v1.sh 1 3"),
+    ]
+    with patch.object(monitor, "_scan_processes", return_value=procs):
+        assert monitor.find_inner_pid() == 111
+
+
+def test_find_inner_pid_none_when_only_driver(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    procs = [(222, "bash /home/sasha/AI/sentry/run-cycles-v1.sh 1 3")]
+    with patch.object(monitor, "_scan_processes", return_value=procs):
+        assert monitor.find_inner_pid() is None
+
+
+def test_kill_inner_sends_sigterm_to_inner_pid(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_read_cmdline", return_value="python3 .../cycle-implementation.py"),
+        patch.object(monitor, "_sleep", return_value=None),
+        patch.object(monitor, "_is_alive", return_value=False),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        assert monitor.kill_inner(111) is True
+    # SIGTERM to the inner pid, and no SIGKILL (process already dead).
+    mock_kill.assert_called_once_with(111, signal.SIGTERM)
+
+
+def test_kill_inner_refuses_driver_pid(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(
+            monitor, "_read_cmdline", return_value="bash /home/sasha/AI/sentry/run-cycles-v1.sh"
+        ),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        assert monitor.kill_inner(222) is False
+    mock_kill.assert_not_called()
+
+
+def test_kill_inner_returns_false_on_process_lookup_error(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_read_cmdline", return_value="python3 .../cycle-implementation.py"),
+        patch("sentry.stall.os.kill", side_effect=ProcessLookupError),
+    ):
+        assert monitor.kill_inner(999) is False
+
+
+# -- handle_stall: decision + SentryLog entries -----------------------------
+
+
+def _stalled_result() -> StallResult:
+    return StallResult(
+        stalled=True, last_movement=BASE, age_seconds=61 * 60, reason="stalled"
+    )
+
+
+def test_handle_stall_not_stalled_logs_probe(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with patch.object(
+        monitor, "detect_stall", return_value=StallResult(stalled=False, reason="not stalled")
+    ):
+        decision = monitor.handle_stall()
+    assert isinstance(decision, StallDecision)
+    assert decision.action == "none"
+    assert decision.logged is True
+    events = [entry.event_type for entry in monitor.log.read_all()]
+    assert "stall.probe" in events
+
+
+def test_handle_stall_waits_when_socket_live(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "wait"
+    events = [entry.event_type for entry in monitor.log.read_all()]
+    assert "stall.wait" in events
+
+
+def test_handle_stall_waits_when_trajectory_growing(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "trajectory_growing", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "wait"
+    events = [entry.event_type for entry in monitor.log.read_all()]
+    assert "stall.wait" in events
+
+
+def test_handle_stall_kills_inner_and_logs_kill(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    assert decision.pid == 111
+    entries = monitor.log.read_all()
+    kill_entries = [e for e in entries if e.event_type == "stall.kill"]
+    assert len(kill_entries) == 1
+    assert kill_entries[0].payload["pid"] == 111
+
+
+def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "trajectory_growing", return_value=False),
+        patch.object(monitor, "find_inner_pid", return_value=None),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "none"
+    mock_kill.assert_not_called()
+    events = [entry.event_type for entry in monitor.log.read_all()]
+    assert "stall.wait" in events
+
+
+# -- real-artifact read-only test (skip gracefully if absent) ---------------
+
+
+def test_detect_stall_against_real_sentry_artifacts(tmp_path: Path) -> None:
+    real_dir = Path("/home/sasha/AI/sentry")
+    if not (real_dir / "cycles.out").exists():
+        pytest.skip("real sentry cycles.out not present")
+    # Pass an explicit log under tmp_path so the watched dir stays read-only.
+    monitor = StallMonitor(real_dir, log=SentryLog(tmp_path / "real-stall.log"))
+    result = monitor.detect_stall()
+    assert isinstance(result, StallResult)
+    assert isinstance(result.stalled, bool)

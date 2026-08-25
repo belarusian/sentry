@@ -4,6 +4,7 @@ from sentry.integration import IntegrationSummary, Integrator
 from sentry.relaunch import Relauncher, RelaunchResult
 from sentry.sentinel import DetectionResult, Sentinel
 from sentry.sentrylog import LogEntry, SentryLog
+from sentry.stall import StallDecision, StallMonitor, StallResult
 
 __version__ = "0.1.0"
 
@@ -16,5 +17,8 @@ __all__ = [
     "Relauncher",
     "Sentinel",
     "SentryLog",
+    "StallDecision",
+    "StallMonitor",
+    "StallResult",
     "__version__",
 ]
