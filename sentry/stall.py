@@ -13,10 +13,29 @@ Timer reconciliation (TICKET-012): the driver kills its inner spoke at
 live spoke, so the threshold is a constructor parameter (``stall_seconds``)
 rather than a hardcoded 60 min.
 
-Kill target (TICKET-013): the inner spoke is an LLM-spawned grandchild with
-no recorded PID; it is located by pattern-matching ``/proc`` for the spoke
-marker (``cycle-implementation.py``). The driver (``run-cycles`` /
-``run*.py``) is NEVER a candidate and is re-checked before any kill.
+Kill target (TICKET-013 / TICKET-028 / TICKET-029 / TICKET-030): the inner
+spoke is an LLM-spawned grandchild with no recorded PID. The real process
+tree for a cycle is::
+
+    bash run-cycles-v1.sh (driver)
+      -> python3 run.py (outer LLM loop)
+           -> bash -c 'python3 .../cycle-implementation.py ...' (LLM bash shell)
+                -> timeout 3000 python3 .../cycle-implementation.py ... (wrapper)
+                     -> python3 .../cycle-implementation.py ... (inner spoke)
+
+The spoke marker (``cycle-implementation.py``) appears in the cmdline of the
+LLM bash shell, the ``timeout``/``perl`` wrapper, AND the actual inner spoke,
+so a first-match ``/proc`` scan can select the wrong layer. ``find_inner_pid``
+therefore collects ALL non-driver marker matches and returns the **deepest**
+(child-most, largest process-tree depth) one -- the actual spoke, not its
+wrapper or shell (TICKET-028). The result is verified to be a **descendant of
+the ``run.py`` PID** (the outer LLM loop, located by ``/proc`` pattern); a
+marker match outside that subtree is rejected (TICKET-029). Before any
+``os.kill``, ``kill_inner`` re-checks the target's cmdline: it must contain
+the spoke marker AND not match a driver pattern (the driver HARD GUARD)
+(TICKET-030). The resolved PID and its cmdline are logged in the
+``stall.kill`` payload (TICKET-031). The driver (``run-cycles`` / ``run*.py``)
+is NEVER a candidate.
 
 Socket probe (TICKET-015 / TICKET-022 / TICKET-023): "socket live" means
 an outbound ``ESTAB`` connection whose *peer* (destination) column is a
@@ -73,6 +92,10 @@ _DRIVER_PATTERNS = (
 
 # Marker for the inner spoke (the LLM-spawned grandchild, TICKET-013).
 _INNER_SPOKE_MARKER = "cycle-implementation.py"
+
+# The outer LLM loop (``run.py``) is the ancestor root for kill-targeting
+# (TICKET-029): the inner spoke must be a descendant of it, not the driver.
+_RUN_PY_RE = re.compile(r"run\.py")
 
 # Column index of the peer (destination) field in ``ss -tnp`` output.
 # The line shape is: State Recv-Q Send-Q Local Peer [Process], so the
@@ -506,20 +529,126 @@ class StallMonitor:
         """True when ``cmdline`` matches a driver pattern."""
         return any(pattern.search(cmdline) for pattern in _DRIVER_PATTERNS)
 
-    def find_inner_pid(self) -> int | None:
-        """Locate the inner-spoke PID by pattern-matching ``/proc``.
+    def _ppid_map(self) -> dict[int, int]:
+        """Return ``{pid: ppid}`` for live processes. Overridable in tests.
 
-        Returns the first non-driver process whose cmdline contains the inner
-        spoke marker (``cycle-implementation.py``). Driver processes
-        (``run-cycles`` / ``run*.py``) are never candidates (TICKET-013).
-        Returns None when no inner spoke is found.
+        Reads field 4 (ppid) of ``/proc/<pid>/stat``. The comm field (field 2)
+        is parenthesized and may contain spaces, so the parse splits on the
+        *last* ``)`` to skip past it; the ppid is then the second whitespace
+        field after it (field 3 = state, field 4 = ppid).
         """
+        result: dict[int, int] = {}
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return result
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as handle:
+                    raw = handle.read()
+            except OSError:
+                continue
+            text = raw.decode("utf-8", "replace")
+            close = text.rfind(")")
+            if close == -1:
+                continue
+            fields = text[close + 1 :].split()
+            if len(fields) >= 2:
+                try:
+                    result[pid] = int(fields[1])
+                except ValueError:
+                    continue
+        return result
+
+    def _process_depth(self, pid: int, ppid_map: dict[int, int]) -> int:
+        """Depth of ``pid`` in the process tree (child-most = largest).
+
+        Counts ancestor hops up the ``ppid_map`` chain; cycle-guarded so a
+        malformed map cannot loop forever.
+        """
+        depth = 0
+        seen: set[int] = set()
+        current = pid
+        while current in ppid_map:
+            if current in seen:
+                break
+            seen.add(current)
+            parent = ppid_map[current]
+            depth += 1
+            if parent == current or parent not in ppid_map:
+                break
+            current = parent
+        return depth
+
+    def _find_run_pid(self) -> int | None:
+        """Locate the outer LLM-loop ``run.py`` PID (not the driver).
+
+        Matches a cmdline containing ``run.py`` while excluding the driver
+        (``run-cycles``). Returns None when no outer loop is found.
+        Overridable in tests.
+        """
+        for pid, cmdline in self._scan_processes():
+            if "run-cycles" in cmdline:
+                continue
+            if _RUN_PY_RE.search(cmdline):
+                return pid
+        return None
+
+    def _is_descendant_of(
+        self, pid: int, ancestor: int, ppid_map: dict[int, int]
+    ) -> bool:
+        """True when ``pid`` is a strict descendant of ``ancestor``.
+
+        Walks the ``ppid_map`` chain up from ``pid``; cycle-guarded.
+        """
+        if pid == ancestor:
+            return False
+        current = pid
+        seen: set[int] = set()
+        while current in ppid_map:
+            if current in seen:
+                return False
+            seen.add(current)
+            parent = ppid_map[current]
+            if parent == ancestor:
+                return True
+            if parent == current or parent not in ppid_map:
+                return False
+            current = parent
+        return False
+
+    def find_inner_pid(self) -> int | None:
+        """Locate the inner-spoke PID to kill (TICKET-013 / TICKET-028 / 029).
+
+        Collects ALL non-driver ``/proc`` cmdline matches for the spoke marker
+        (``cycle-implementation.py``) and returns the **deepest** (child-most)
+        one -- the actual spoke, not the ``timeout``/``perl`` wrapper or the
+        LLM bash-tool shell (TICKET-028). The result is then verified to be a
+        **descendant of the ``run.py`` PID** (the outer LLM loop); a marker
+        match outside that subtree is rejected (TICKET-029). Driver processes
+        (``run-cycles`` / ``run*.py``) are never candidates. When the ``run.py``
+        PID cannot be located, falls back to the deepest marker match. Returns
+        None when no inner spoke is found.
+        """
+        candidates: list[int] = []
         for pid, cmdline in self._scan_processes():
             if self._is_driver_cmdline(cmdline):
                 continue
             if _INNER_SPOKE_MARKER in cmdline:
-                return pid
-        return None
+                candidates.append(pid)
+        if not candidates:
+            return None
+        ppid_map = self._ppid_map()
+        deepest = max(candidates, key=lambda p: self._process_depth(p, ppid_map))
+        run_pid = self._find_run_pid()
+        if run_pid is not None and not self._is_descendant_of(
+            deepest, run_pid, ppid_map
+        ):
+            return None
+        return deepest
 
     def _read_cmdline(self, pid: int) -> str | None:
         """Read ``/proc/<pid>/cmdline`` (None on error). Overridable."""
@@ -554,6 +683,10 @@ class StallMonitor:
         cmdline = self._read_cmdline(pid)
         if cmdline is not None and self._is_driver_cmdline(cmdline):
             return False  # HARD GUARD: never the driver
+        # TICKET-030: verify the target's cmdline actually contains the spoke
+        # marker before killing (guards against a reused/stale PID).
+        if cmdline is None or _INNER_SPOKE_MARKER not in cmdline:
+            return False
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, OSError):
@@ -640,6 +773,7 @@ class StallMonitor:
                 "stall.kill",
                 {
                     "pid": pid,
+                    "cmdline": self._read_cmdline(pid),
                     "reason": result.reason,
                     "age_seconds": result.age_seconds,
                 },
