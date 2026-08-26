@@ -305,7 +305,11 @@ def test_find_inner_pid_returns_inner_not_driver(tmp_path: Path) -> None:
         (111, "python3 /home/sasha/Research/four/examples/spokes/cycle-implementation.py --cycle 4"),
         (222, "bash /home/sasha/AI/sentry/run-cycles-v1.sh 1 3"),
     ]
-    with patch.object(monitor, "_scan_processes", return_value=procs):
+    with (
+        patch.object(monitor, "_scan_processes", return_value=procs),
+        patch.object(monitor, "_ppid_map", return_value={}),
+        patch.object(monitor, "_find_run_pid", return_value=None),
+    ):
         assert monitor.find_inner_pid() == 111
 
 
@@ -314,6 +318,74 @@ def test_find_inner_pid_none_when_only_driver(tmp_path: Path) -> None:
     procs = [(222, "bash /home/sasha/AI/sentry/run-cycles-v1.sh 1 3")]
     with patch.object(monitor, "_scan_processes", return_value=procs):
         assert monitor.find_inner_pid() is None
+
+
+def test_find_inner_pid_returns_deepest_not_wrapper(tmp_path: Path) -> None:
+    """TICKET-028: when the LLM bash shell, the wrapper, AND the inner spoke
+    all match the marker, return the DEEPEST (child-most) PID -- the spoke."""
+    monitor = _make_monitor(tmp_path)
+    marker = "cycle-implementation.py"
+    procs = [
+        (100, f"bash -c 'python3 .../{marker} ...'"),   # LLM bash shell
+        (200, f"timeout 3000 python3 .../{marker} ..."),  # wrapper
+        (300, f"python3 .../{marker} --cycle 9"),         # inner spoke (deepest)
+    ]
+    # spoke(300) -> wrapper(200) -> shell(100) -> run.py(50)
+    ppid_map = {300: 200, 200: 100, 100: 50}
+    with (
+        patch.object(monitor, "_scan_processes", return_value=procs),
+        patch.object(monitor, "_ppid_map", return_value=ppid_map),
+        patch.object(monitor, "_find_run_pid", return_value=50),
+    ):
+        assert monitor.find_inner_pid() == 300
+
+
+def test_find_inner_pid_rejects_non_descendant_of_run_py(tmp_path: Path) -> None:
+    """TICKET-029: a marker match that is NOT a descendant of the located
+    run.py PID is rejected (find_inner_pid returns None)."""
+    monitor = _make_monitor(tmp_path)
+    marker = "cycle-implementation.py"
+    procs = [(300, f"python3 .../{marker} --cycle 9")]
+    # 300's parent chain does not reach run.py (50); it leads to 999 (absent).
+    ppid_map = {300: 999}
+    with (
+        patch.object(monitor, "_scan_processes", return_value=procs),
+        patch.object(monitor, "_ppid_map", return_value=ppid_map),
+        patch.object(monitor, "_find_run_pid", return_value=50),
+    ):
+        assert monitor.find_inner_pid() is None
+
+
+def test_find_inner_pid_accepts_descendant_of_run_py(tmp_path: Path) -> None:
+    """TICKET-029: a marker match that IS a descendant of run.py is accepted."""
+    monitor = _make_monitor(tmp_path)
+    marker = "cycle-implementation.py"
+    procs = [(300, f"python3 .../{marker} --cycle 9")]
+    ppid_map = {300: 50}  # direct child of run.py (50)
+    with (
+        patch.object(monitor, "_scan_processes", return_value=procs),
+        patch.object(monitor, "_ppid_map", return_value=ppid_map),
+        patch.object(monitor, "_find_run_pid", return_value=50),
+    ):
+        assert monitor.find_inner_pid() == 300
+
+
+def test_find_inner_pid_fallback_when_run_py_not_found(tmp_path: Path) -> None:
+    """TICKET-029: when run.py cannot be located, fall back to the deepest
+    marker match (do not silently kill, but do not lose the target)."""
+    monitor = _make_monitor(tmp_path)
+    marker = "cycle-implementation.py"
+    procs = [
+        (200, f"timeout 3000 python3 .../{marker} ..."),
+        (300, f"python3 .../{marker} --cycle 9"),
+    ]
+    ppid_map = {300: 200}
+    with (
+        patch.object(monitor, "_scan_processes", return_value=procs),
+        patch.object(monitor, "_ppid_map", return_value=ppid_map),
+        patch.object(monitor, "_find_run_pid", return_value=None),
+    ):
+        assert monitor.find_inner_pid() == 300
 
 
 def test_kill_inner_sends_sigterm_to_inner_pid(tmp_path: Path) -> None:
@@ -348,6 +420,18 @@ def test_kill_inner_returns_false_on_process_lookup_error(tmp_path: Path) -> Non
         patch("sentry.stall.os.kill", side_effect=ProcessLookupError),
     ):
         assert monitor.kill_inner(999) is False
+
+
+def test_kill_inner_refuses_pid_without_spoke_marker(tmp_path: Path) -> None:
+    """TICKET-030: kill_inner refuses a target whose cmdline does not contain
+    the spoke marker (guards against a reused/stale PID)."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_read_cmdline", return_value="vim /tmp/notes.txt"),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        assert monitor.kill_inner(999) is False
+    mock_kill.assert_not_called()
 
 
 # -- handle_stall: decision + SentryLog entries -----------------------------
@@ -453,6 +537,28 @@ def test_handle_stall_kills_inner_and_logs_kill(tmp_path: Path) -> None:
     kill_entries = [e for e in entries if e.event_type == "stall.kill"]
     assert len(kill_entries) == 1
     assert kill_entries[0].payload["pid"] == 111
+
+
+def test_handle_stall_kill_payload_carries_pid_and_cmdline(tmp_path: Path) -> None:
+    """TICKET-031: the stall.kill payload carries the resolved PID AND its
+    cmdline."""
+    monitor = _make_monitor(tmp_path)
+    cmdline = "python3 .../cycle-implementation.py --cycle 9"
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+        patch.object(monitor, "_read_cmdline", return_value=cmdline),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    entries = monitor.log.read_all()
+    kill_entries = [e for e in entries if e.event_type == "stall.kill"]
+    assert len(kill_entries) == 1
+    assert kill_entries[0].payload["pid"] == 111
+    assert kill_entries[0].payload["cmdline"] == cmdline
 
 
 def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
