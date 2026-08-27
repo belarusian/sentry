@@ -40,6 +40,19 @@ def _fmt_list(values) -> str:
     return "[" + ", ".join(str(v) for v in sorted(values)) + "]"
 
 
+def _fmt_proctree(p: dict) -> str:
+    """Render the process-tree state section (TICKET-033 / TICKET-041).
+
+    ``live work: yes (root=1234)`` with the sample cmdlines on the same line,
+    or ``live work: no`` when the tree has no non-LLM child.
+    """
+    if not p.get("live"):
+        return "live work: no"
+    samples = p.get("samples") or []
+    sample_txt = " | ".join(samples) if samples else ""
+    return f"live work: yes (root={p.get('root')})" + (f" :: {sample_txt}" if sample_txt else "")
+
+
 class SentryCLI:
     """Orchestrates the supervisor components behind the two subcommands."""
 
@@ -93,6 +106,15 @@ class SentryCLI:
             return "wait", "inference active + generating (healthy-slow)"
         if blind:
             return "none", "endpoint blind - cannot confirm wedged"
+        # TICKET-033 / TICKET-039 / TICKET-040: process-tree state signal, in
+        # the same order handle_stall uses it (after the endpoint blind check,
+        # before the find_inner_pid/kill branches). LLM idle + a live non-LLM
+        # child under the pipeline root -> WAIT (waiting on work, not wedged).
+        # The process-tree walk reads /proc only (no project write), so the
+        # read-only invariant holds and no SentryLog append is introduced here.
+        root_pid = monitor._resolve_pipeline_root()
+        if root_pid is not None and monitor.has_live_work(root_pid)[0]:
+            return "wait", "live work in process tree (waiting on work, not wedged)"
         pid = monitor.find_inner_pid()
         if pid is None:
             return "none", "stalled but no inner pid found"
@@ -113,12 +135,22 @@ class SentryCLI:
         )
         summary = integrator.summary()
         action_needed = bool(death.detected or wallkill.detected or stall_action == "kill")
+        # TICKET-033 / TICKET-041: process-tree state section for the check
+        # report (live work? sample cmdlines). Read-only: the walk reads /proc
+        # only, so the read-only invariant holds.
+        root_pid = monitor._resolve_pipeline_root()
+        if root_pid is not None:
+            live_work, live_samples = monitor.has_live_work(root_pid)
+            proctree = {"root": root_pid, "live": live_work, "samples": live_samples}
+        else:
+            proctree = {"root": None, "live": False, "samples": []}
         return {
             "driver_alive": self.sentinel.is_driver_process_alive(),
             "death": death,
             "wallkill": wallkill,
             "stall_action": stall_action,
             "stall_reason": stall_reason,
+            "proctree": proctree,
             "summary": summary,
             "action_needed": action_needed,
         }
@@ -138,6 +170,7 @@ class SentryCLI:
                 else "wall-kill-no-merge: none"
             ),
             f"stall: {f['stall_action']} ({f['stall_reason']})",
+            _fmt_proctree(f["proctree"]),
             (
                 "cycles: started=" + _fmt_list(s.started)
                 + " done=" + _fmt_list(s.done)

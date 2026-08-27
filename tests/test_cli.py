@@ -31,13 +31,20 @@ def _make_project(tmp_path: Path, cycles_text: str) -> Path:
 
 def _mock_monitor(stalled: bool = False, socket_live: bool = False, moving: bool = False,
                   inner_pid: int | None = None,
-                  inference_active: tuple = (False, False, False, {})) -> MagicMock:
+                  inference_active: tuple = (False, False, False, {}),
+                  root_pid: int | None = None,
+                  has_live_work: tuple = (False, [])) -> MagicMock:
     m = MagicMock()
     m.detect_stall.return_value = StallResult(stalled=stalled, reason="x")
     m.any_socket_live.return_value = socket_live
     m.movement_recent_fine.return_value = moving
     m.find_inner_pid.return_value = inner_pid
     m.inference_active.return_value = inference_active
+    # TICKET-040: process-tree live-work signal. Default root_pid None keeps
+    # the gate skipped (existing tests unchanged); has_live_work (False, [])
+    # is the bare-tree default.
+    m._resolve_pipeline_root.return_value = root_pid
+    m.has_live_work.return_value = has_live_work
     return m
 
 
@@ -179,6 +186,52 @@ def test_check_stall_blind_none_exit_0(tmp_path, capsys):
     assert "stall: none" in out
 
 
+def test_check_stall_live_work_wait_exit_0(tmp_path, capsys):
+    """TICKET-040: LLM idle + a live non-LLM child under the root -> WAIT
+    (waiting on work, not wedged) in the read-only check path (no SentryLog
+    append)."""
+    _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
+    cli = SentryCLI(tmp_path)
+    cli.monitor = _mock_monitor(
+        stalled=True, socket_live=False, moving=False, inner_pid=1234,
+        root_pid=50, has_live_work=(True, ["bash -c 'validator'"]),
+    )
+    with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
+         patch.object(cli.sentinel, "detect_driver_death",
+                      return_value=DetectionResult(False, reason="none")), \
+         patch.object(cli.sentinel, "detect_wall_kill_no_merge",
+                      return_value=DetectionResult(False, reason="none")):
+        code = cli.run_check()
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "stall: wait" in out
+    assert "live work in process tree" in out
+    # TICKET-041: the check report carries the process-tree section
+    # (live work? sample cmdlines), distinct from the stall reason line.
+    assert "live work: yes (root=50)" in out
+    assert "bash -c 'validator'" in out
+
+
+def test_check_proctree_section_no_live_work(tmp_path, capsys):
+    """TICKET-041: the check report shows ``live work: no`` when the tree has
+    no non-LLM child (bare tree)."""
+    _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
+    cli = SentryCLI(tmp_path)
+    cli.monitor = _mock_monitor(
+        stalled=True, socket_live=False, moving=False, inner_pid=1234,
+        root_pid=50, has_live_work=(False, []),
+    )
+    with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
+         patch.object(cli.sentinel, "detect_driver_death",
+                      return_value=DetectionResult(False, reason="none")), \
+         patch.object(cli.sentinel, "detect_wall_kill_no_merge",
+                      return_value=DetectionResult(False, reason="none")):
+        code = cli.run_check()
+    out = capsys.readouterr().out
+    assert code == EXIT_ACTION
+    assert "live work: no" in out
+
+
 def test_check_writes_nothing_under_watched_project(tmp_path):
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     before = sorted(p.name for p in tmp_path.iterdir())
@@ -279,32 +332,41 @@ def test_rescue_apply_stall_kill_exit_1(tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    "stalled,socket_live,moving,inner_pid,inference,expected",
+    "stalled,socket_live,moving,inner_pid,inference,root_pid,live_work,expected",
     [
-        (False, False, False, None, (False, False, False, {}), "none"),
-        (True, True, True, None, (False, False, False, {}), "wait"),
-        (True, False, True, None, (False, False, False, {}), "wait"),
-        (True, True, False, 1234, (False, False, False, {}), "kill"),
-        (True, False, False, 1234, (False, False, False, {}), "kill"),
-        (True, True, False, None, (False, False, False, {}), "none"),
-        (True, False, False, None, (False, False, False, {}), "none"),
+        (False, False, False, None, (False, False, False, {}), None, (False, []), "none"),
+        (True, True, True, None, (False, False, False, {}), None, (False, []), "wait"),
+        (True, False, True, None, (False, False, False, {}), None, (False, []), "wait"),
+        (True, True, False, 1234, (False, False, False, {}), None, (False, []), "kill"),
+        (True, False, False, 1234, (False, False, False, {}), None, (False, []), "kill"),
+        (True, True, False, None, (False, False, False, {}), None, (False, []), "none"),
+        (True, False, False, None, (False, False, False, {}), None, (False, []), "none"),
         # TICKET-037: the endpoint WAIT gate (inference active + generating).
-        (True, False, False, 1234, (True, True, False, {}), "wait"),
-        (True, True, False, 1234, (True, True, False, {}), "wait"),
+        (True, False, False, 1234, (True, True, False, {}), None, (False, []), "wait"),
+        (True, True, False, 1234, (True, True, False, {}), None, (False, []), "wait"),
         # TICKET-037: blind endpoint -> none (never kill on a blind basis).
-        (True, False, False, 1234, (False, False, True, {}), "none"),
-        (True, True, False, 1234, (False, False, True, {}), "none"),
+        (True, False, False, 1234, (False, False, True, {}), None, (False, []), "none"),
+        (True, True, False, 1234, (False, False, True, {}), None, (False, []), "none"),
         # TICKET-037: active but NOT generating -> existing kill path.
-        (True, False, False, 1234, (True, False, False, {}), "kill"),
+        (True, False, False, 1234, (True, False, False, {}), None, (False, []), "kill"),
+        # TICKET-040: process-tree live-work WAIT gate (idle + live child).
+        (True, False, False, 1234, (False, False, False, {}), 50, (True, ["bash"]), "wait"),
+        (True, True, False, 1234, (False, False, False, {}), 50, (True, ["gh pr list"]), "wait"),
+        # TICKET-040: bare tree (no live children) -> existing kill path.
+        (True, False, False, 1234, (False, False, False, {}), 50, (False, []), "kill"),
+        (True, True, False, 1234, (False, False, False, {}), 50, (False, []), "kill"),
+        # TICKET-040: no root resolvable -> gate skipped, existing kill path.
+        (True, False, False, 1234, (False, False, False, {}), None, (True, ["bash"]), "kill"),
     ],
 )
 def test_stall_decision_parity_readonly_matches_handle_stall(
-    tmp_path, stalled, socket_live, moving, inner_pid, inference, expected
+    tmp_path, stalled, socket_live, moving, inner_pid, inference, root_pid, live_work, expected
 ):
-    """TICKET-026 / TICKET-037: for a given probe state, the read-only
-    ``check`` decision and the write ``rescue`` decision must agree. A real
-    StallMonitor with patched leaf probes lets both code paths run the real
-    logic over the same state, including the endpoint WAIT gate."""
+    """TICKET-026 / TICKET-037 / TICKET-040: for a given probe state, the
+    read-only ``check`` decision and the write ``rescue`` decision must agree.
+    A real StallMonitor with patched leaf probes lets both code paths run the
+    real logic over the same state, including the endpoint WAIT gate and the
+    process-tree live-work WAIT gate."""
     cli = SentryCLI(tmp_path)
     monitor = StallMonitor(tmp_path, log=SentryLog(tmp_path / "parity.log"))
     result = StallResult(
@@ -315,6 +377,8 @@ def test_stall_decision_parity_readonly_matches_handle_stall(
         patch.object(monitor, "any_socket_live", return_value=socket_live),
         patch.object(monitor, "movement_recent_fine", return_value=moving),
         patch.object(monitor, "inference_active", return_value=inference),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=root_pid),
+        patch.object(monitor, "has_live_work", return_value=live_work),
         patch.object(monitor, "find_inner_pid", return_value=inner_pid),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
