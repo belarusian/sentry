@@ -464,6 +464,7 @@ def test_handle_stall_bare_estab_no_movement_kills(tmp_path: Path) -> None:
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
         patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -484,6 +485,7 @@ def test_handle_stall_bare_estab_no_movement_no_pid_is_noop(tmp_path: Path) -> N
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=True),
         patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):
@@ -527,6 +529,7 @@ def test_handle_stall_kills_inner_and_logs_kill(tmp_path: Path) -> None:
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -548,6 +551,7 @@ def test_handle_stall_kill_payload_carries_pid_and_cmdline(tmp_path: Path) -> No
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
         patch.object(monitor, "_read_cmdline", return_value=cmdline),
@@ -567,6 +571,7 @@ def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
         patch.object(monitor, "detect_stall", return_value=_stalled_result()),
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):
@@ -575,6 +580,165 @@ def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
     mock_kill.assert_not_called()
     events = [entry.event_type for entry in monitor.log.read_all()]
     assert "stall.wait" in events
+
+
+# -- inference-endpoint state signal (TICKET-032 / TICKET-036) --------------
+
+
+def _endpoint_samples() -> tuple:
+    """Two probe() samples with an advancing counter (generating)."""
+    base = "http://192.168.1.157:8080"
+    return (
+        {base: {"reachable": True, "requests_processing": 1.0,
+                "tokens_predicted_total": 100.0, "n_decode_total": 10.0,
+                "predicted_tokens_seconds": 17.0}},
+        {base: {"reachable": True, "requests_processing": 1.0,
+                "tokens_predicted_total": 150.0, "n_decode_total": 15.0,
+                "predicted_tokens_seconds": 17.0}},
+    )
+
+
+def test_handle_stall_inference_active_generating_waits(tmp_path: Path) -> None:
+    """TICKET-036: requests_processing > 0 AND generating -> WAIT
+    (healthy-slow), logged with endpoint evidence."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(
+            monitor,
+            "inference_active",
+            return_value=(True, True, False, {"endpoint_samples": _endpoint_samples()}),
+        ),
+        patch("sentry.stall.os.kill") as mock_kill,
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "wait"
+    assert decision.reason == "inference active + generating (healthy-slow)"
+    mock_kill.assert_not_called()
+    entries = monitor.log.read_all()
+    wait_entries = [e for e in entries if e.event_type == "stall.wait"]
+    assert len(wait_entries) == 1
+    assert wait_entries[0].payload["reason"] == "inference active + generating (healthy-slow)"
+    # Endpoint evidence is recorded in the payload.
+    assert "endpoint" in wait_entries[0].payload
+    assert "endpoint_samples" in decision.evidence
+
+
+def test_handle_stall_blind_does_not_kill(tmp_path: Path) -> None:
+    """TICKET-036: a blind endpoint (unreachable / /metrics unsupported) is
+    NOT treated as wedged on that basis alone -> none, never a KILL."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(
+            monitor,
+            "inference_active",
+            return_value=(False, False, True, {"endpoint_samples": _endpoint_samples()}),
+        ),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True) as mock_kill,
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "none"
+    assert decision.reason == "endpoint blind - cannot confirm wedged"
+    mock_kill.assert_not_called()
+    entries = monitor.log.read_all()
+    wait_entries = [e for e in entries if e.event_type == "stall.wait"]
+    assert len(wait_entries) == 1
+    assert wait_entries[0].payload["reason"] == "endpoint blind - cannot confirm wedged"
+
+
+def test_handle_stall_active_not_generating_falls_through(tmp_path: Path) -> None:
+    """TICKET-036: requests_processing > 0 but NOT generating (flat counters)
+    -> existing path (kill) unchanged."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(
+            monitor,
+            "inference_active",
+            return_value=(True, False, False, {"endpoint_samples": _endpoint_samples()}),
+        ),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    assert decision.pid == 111
+
+
+def test_inference_active_returns_signal(tmp_path: Path) -> None:
+    """TICKET-036: inference_active() takes two probe() samples with a sleep
+    between and returns (rp_positive, generating, blind, evidence)."""
+    monitor = _make_monitor(tmp_path)
+    samples = _endpoint_samples()
+    with (
+        patch.object(monitor.endpoint_probe, "probe", side_effect=[samples[0], samples[1]]),
+        patch.object(monitor, "_sleep", return_value=None) as mock_sleep,
+    ):
+        rp_positive, generating, blind, evidence = monitor.inference_active()
+    assert rp_positive is True
+    assert generating is True
+    assert blind is False
+    assert evidence["endpoint_samples"] == samples
+    mock_sleep.assert_called_once()
+
+
+def test_inference_active_blind_when_no_endpoint_reachable(tmp_path: Path) -> None:
+    monitor = _make_monitor(tmp_path)
+    blind_sample = {
+        "http://192.168.1.157:8080": {
+            "reachable": False, "requests_processing": None,
+            "tokens_predicted_total": None, "n_decode_total": None,
+            "predicted_tokens_seconds": None,
+        }
+    }
+    with (
+        patch.object(monitor.endpoint_probe, "probe", return_value=blind_sample),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        rp_positive, _generating, blind, _ = monitor.inference_active()
+    assert rp_positive is False
+    assert _generating is False
+    assert blind is True
+
+
+def test_inference_active_blind_when_metrics_unsupported(tmp_path: Path) -> None:
+    """Reachable but requests_processing None (/metrics unsupported) -> blind."""
+    monitor = _make_monitor(tmp_path)
+    sample = {
+        "http://192.168.1.157:8080": {
+            "reachable": True, "requests_processing": None,
+            "tokens_predicted_total": None, "n_decode_total": None,
+            "predicted_tokens_seconds": None,
+        }
+    }
+    with (
+        patch.object(monitor.endpoint_probe, "probe", return_value=sample),
+        patch.object(monitor, "_sleep", return_value=None),
+    ):
+        rp_positive, _generating, blind, _ = monitor.inference_active()
+    assert rp_positive is False
+    assert _generating is False
+    assert blind is True
+
+
+def test_endpoint_probe_base_urls_derived_from_endpoints(tmp_path: Path) -> None:
+    """TICKET-036: the EndpointProbe base URLs are http://host:port derived
+    from the socket endpoints."""
+    monitor = _make_monitor(tmp_path)
+    assert monitor.endpoint_probe.base_urls == (
+        "http://192.168.1.157:8080",
+        "http://192.168.1.161:8081",
+    )
+
+
 
 
 # -- real-artifact read-only test (skip gracefully if absent) ---------------

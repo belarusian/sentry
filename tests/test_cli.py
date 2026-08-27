@@ -30,12 +30,14 @@ def _make_project(tmp_path: Path, cycles_text: str) -> Path:
 
 
 def _mock_monitor(stalled: bool = False, socket_live: bool = False, moving: bool = False,
-                  inner_pid: int | None = None) -> MagicMock:
+                  inner_pid: int | None = None,
+                  inference_active: tuple = (False, False, False, {})) -> MagicMock:
     m = MagicMock()
     m.detect_stall.return_value = StallResult(stalled=stalled, reason="x")
     m.any_socket_live.return_value = socket_live
     m.movement_recent_fine.return_value = moving
     m.find_inner_pid.return_value = inner_pid
+    m.inference_active.return_value = inference_active
     return m
 
 
@@ -138,6 +140,45 @@ def test_check_stall_bare_estab_kills_exit_1(tmp_path, capsys):
     assert "stall: kill" in out
 
 
+def test_check_stall_inference_generating_wait_exit_0(tmp_path, capsys):
+    """TICKET-037: inference active + generating -> WAIT (healthy-slow) in the
+    read-only check path (no SentryLog append)."""
+    _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
+    cli = SentryCLI(tmp_path)
+    cli.monitor = _mock_monitor(
+        stalled=True, socket_live=False, moving=False, inner_pid=1234,
+        inference_active=(True, True, False, {}),
+    )
+    with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
+         patch.object(cli.sentinel, "detect_driver_death",
+                      return_value=DetectionResult(False, reason="none")), \
+         patch.object(cli.sentinel, "detect_wall_kill_no_merge",
+                      return_value=DetectionResult(False, reason="none")):
+        code = cli.run_check()
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "stall: wait" in out
+
+
+def test_check_stall_blind_none_exit_0(tmp_path, capsys):
+    """TICKET-037: a blind endpoint -> none (never kill on a blind basis)."""
+    _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
+    cli = SentryCLI(tmp_path)
+    cli.monitor = _mock_monitor(
+        stalled=True, socket_live=False, moving=False, inner_pid=1234,
+        inference_active=(False, False, True, {}),
+    )
+    with patch.object(cli.sentinel, "is_driver_process_alive", return_value=True), \
+         patch.object(cli.sentinel, "detect_driver_death",
+                      return_value=DetectionResult(False, reason="none")), \
+         patch.object(cli.sentinel, "detect_wall_kill_no_merge",
+                      return_value=DetectionResult(False, reason="none")):
+        code = cli.run_check()
+    out = capsys.readouterr().out
+    assert code == EXIT_OK
+    assert "stall: none" in out
+
+
 def test_check_writes_nothing_under_watched_project(tmp_path):
     _make_project(tmp_path, START_1 + "\n" + DONE_1 + "\n")
     before = sorted(p.name for p in tmp_path.iterdir())
@@ -238,24 +279,32 @@ def test_rescue_apply_stall_kill_exit_1(tmp_path, capsys):
 
 
 @pytest.mark.parametrize(
-    "stalled,socket_live,moving,inner_pid,expected",
+    "stalled,socket_live,moving,inner_pid,inference,expected",
     [
-        (False, False, False, None, "none"),
-        (True, True, True, None, "wait"),
-        (True, False, True, None, "wait"),
-        (True, True, False, 1234, "kill"),
-        (True, False, False, 1234, "kill"),
-        (True, True, False, None, "none"),
-        (True, False, False, None, "none"),
+        (False, False, False, None, (False, False, False, {}), "none"),
+        (True, True, True, None, (False, False, False, {}), "wait"),
+        (True, False, True, None, (False, False, False, {}), "wait"),
+        (True, True, False, 1234, (False, False, False, {}), "kill"),
+        (True, False, False, 1234, (False, False, False, {}), "kill"),
+        (True, True, False, None, (False, False, False, {}), "none"),
+        (True, False, False, None, (False, False, False, {}), "none"),
+        # TICKET-037: the endpoint WAIT gate (inference active + generating).
+        (True, False, False, 1234, (True, True, False, {}), "wait"),
+        (True, True, False, 1234, (True, True, False, {}), "wait"),
+        # TICKET-037: blind endpoint -> none (never kill on a blind basis).
+        (True, False, False, 1234, (False, False, True, {}), "none"),
+        (True, True, False, 1234, (False, False, True, {}), "none"),
+        # TICKET-037: active but NOT generating -> existing kill path.
+        (True, False, False, 1234, (True, False, False, {}), "kill"),
     ],
 )
 def test_stall_decision_parity_readonly_matches_handle_stall(
-    tmp_path, stalled, socket_live, moving, inner_pid, expected
+    tmp_path, stalled, socket_live, moving, inner_pid, inference, expected
 ):
-    """TICKET-026: for a given probe state, the read-only ``check`` decision
-    and the write ``rescue`` decision must agree. A real StallMonitor with
-    patched leaf probes lets both code paths run the real logic over the
-    same state."""
+    """TICKET-026 / TICKET-037: for a given probe state, the read-only
+    ``check`` decision and the write ``rescue`` decision must agree. A real
+    StallMonitor with patched leaf probes lets both code paths run the real
+    logic over the same state, including the endpoint WAIT gate."""
     cli = SentryCLI(tmp_path)
     monitor = StallMonitor(tmp_path, log=SentryLog(tmp_path / "parity.log"))
     result = StallResult(
@@ -265,6 +314,7 @@ def test_stall_decision_parity_readonly_matches_handle_stall(
         patch.object(monitor, "detect_stall", return_value=result),
         patch.object(monitor, "any_socket_live", return_value=socket_live),
         patch.object(monitor, "movement_recent_fine", return_value=moving),
+        patch.object(monitor, "inference_active", return_value=inference),
         patch.object(monitor, "find_inner_pid", return_value=inner_pid),
         patch.object(monitor, "kill_inner", return_value=True),
     ):

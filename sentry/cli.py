@@ -80,6 +80,19 @@ class SentryCLI:
         socket_live = monitor.any_socket_live()
         if monitor.movement_recent_fine():
             return "wait", "append-only artifact moving during pass"
+        # TICKET-037: consume the same inference-endpoint signal handle_stall
+        # uses, in the same order (TICKET-032/036). A healthy-slow inference
+        # (request in flight AND generating) is WAIT; a blind endpoint is NOT
+        # treated as wedged on that basis alone (none, never kill). The probe
+        # is a network GET (no project write), so the read-only invariant holds
+        # and no SentryLog append is introduced here.
+        requests_processing_positive, generating, blind, _evidence = (
+            monitor.inference_active()
+        )
+        if requests_processing_positive and generating:
+            return "wait", "inference active + generating (healthy-slow)"
+        if blind:
+            return "none", "endpoint blind - cannot confirm wedged"
         pid = monitor.find_inner_pid()
         if pid is None:
             return "none", "stalled but no inner pid found"

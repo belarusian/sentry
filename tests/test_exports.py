@@ -11,6 +11,7 @@ def test_exports_present():
     assert sentry.Relauncher is not None
     assert sentry.RelaunchResult is not None
     assert sentry.SentryLog is not None
+    assert sentry.EndpointProbe is not None
 
 
 def test_all_names_resolvable():
