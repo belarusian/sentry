@@ -2,6 +2,7 @@
 
 from sentry.endpoint import EndpointProbe
 from sentry.integration import IntegrationSummary, Integrator
+from sentry.proctree import ProcessTree
 from sentry.relaunch import Relauncher, RelaunchResult
 from sentry.sentinel import DetectionResult, Sentinel
 from sentry.sentrylog import LogEntry, SentryLog
@@ -15,6 +16,7 @@ __all__ = [
     "IntegrationSummary",
     "Integrator",
     "LogEntry",
+    "ProcessTree",
     "RelaunchResult",
     "Relauncher",
     "Sentinel",

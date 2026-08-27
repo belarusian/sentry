@@ -82,6 +82,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from sentry.endpoint import EndpointProbe
+from sentry.proctree import ProcessTree
 from sentry.sentrylog import SentryLog
 
 # Process patterns that identify a live driver (bash driver or python runner).
@@ -202,6 +203,10 @@ class StallMonitor:
             tuple(f"http://{endpoint}" for endpoint in self.endpoints),
             timeout=5.0,
         )
+        # TICKET-039 / TICKET-040: process-tree state signal (TICKET-033).
+        # No I/O happens here (ProcessTree.__init__ stores state only),
+        # mirroring the EndpointProbe construction above.
+        self.proctree = ProcessTree()
         self.trajectories_dir = (
             Path(trajectories_dir)
             if trajectories_dir is not None
@@ -558,6 +563,31 @@ class StallMonitor:
         evidence = {"endpoint_samples": samples}
         return requests_processing_positive, generating, blind, evidence
 
+    # -- process-tree live-work signal (TICKET-033 / TICKET-039 / 040) ------
+
+    def has_live_work(self, root_pid: int) -> tuple[bool, list[str]]:
+        """Return ``(is_live, sample_cmdlines)`` for the tree rooted at ``root_pid``.
+
+        Overridable seam delegating to :attr:`self.proctree` (mirrors the
+        :meth:`inference_active` seam). True when a non-LLM child (bash/python/
+        gh/npm/pytest/sleep) is running under the root, excluding the driver and
+        the LLM machinery (TICKET-033).
+        """
+        return self.proctree.has_live_work(root_pid)
+
+    def _resolve_pipeline_root(self) -> int | None:
+        """Resolve the pipeline root PID for the process-tree live-work check.
+
+        Prefers the outer LLM-loop ``run.py`` PID (``_find_run_pid``); when it
+        cannot be located, falls back to the deepest inner-spoke marker match
+        (``find_inner_pid``). Returns None when neither is found.
+        Overridable in tests.
+        """
+        run_pid = self._find_run_pid()
+        if run_pid is not None:
+            return run_pid
+        return self.find_inner_pid()
+
     # -- process scan / kill ------------------------------------------------
 
     def _scan_processes(self) -> list[tuple[int, str]]:
@@ -854,6 +884,39 @@ class StallMonitor:
                 evidence=evidence,
                 logged=True,
             )
+        # TICKET-033 / TICKET-039 / TICKET-040: process-tree state signal.
+        # LLM idle (no movement, endpoint not generating) BUT a non-LLM child
+        # is actively running under the pipeline root -> WAIT (waiting on work,
+        # not wedged). This is a NEW WAIT trigger, distinct from the movement-
+        # and endpoint-based ones; it does not weaken the TICKET-022/027 socket
+        # rule (the socket probe still never triggers WAIT on its own). When
+        # there is no live work, fall through to the existing
+        # find_inner_pid/kill_inner path UNCHANGED.
+        root_pid = self._resolve_pipeline_root()
+        if root_pid is not None:
+            live_work, live_samples = self.has_live_work(root_pid)
+            evidence["proctree"] = {
+                "root": root_pid,
+                "live": live_work,
+                "samples": live_samples,
+            }
+            if live_work:
+                self.log.append(
+                    "stall.wait",
+                    {
+                        "reason": "live work in process tree (waiting on work, not wedged)",
+                        "socket_live": socket_live,
+                        "proctree": evidence["proctree"],
+                        "last_movement": result.last_movement,
+                        "age_seconds": result.age_seconds,
+                    },
+                )
+                return StallDecision(
+                    action="wait",
+                    reason="live work in process tree (waiting on work, not wedged)",
+                    evidence=evidence,
+                    logged=True,
+                )
         pid = self.find_inner_pid()
         if pid is None:
             self.log.append(

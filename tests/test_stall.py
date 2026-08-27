@@ -465,6 +465,7 @@ def test_handle_stall_bare_estab_no_movement_kills(tmp_path: Path) -> None:
         patch.object(monitor, "any_socket_live", return_value=True),
         patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -486,6 +487,7 @@ def test_handle_stall_bare_estab_no_movement_no_pid_is_noop(tmp_path: Path) -> N
         patch.object(monitor, "any_socket_live", return_value=True),
         patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):
@@ -530,6 +532,7 @@ def test_handle_stall_kills_inner_and_logs_kill(tmp_path: Path) -> None:
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
@@ -552,6 +555,7 @@ def test_handle_stall_kill_payload_carries_pid_and_cmdline(tmp_path: Path) -> No
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
         patch.object(monitor, "_read_cmdline", return_value=cmdline),
@@ -572,6 +576,7 @@ def test_handle_stall_no_inner_pid_is_safe_noop(tmp_path: Path) -> None:
         patch.object(monitor, "any_socket_live", return_value=False),
         patch.object(monitor, "movement_recent_fine", return_value=False),
         patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=None),
         patch("sentry.stall.os.kill") as mock_kill,
     ):
@@ -665,12 +670,123 @@ def test_handle_stall_active_not_generating_falls_through(tmp_path: Path) -> Non
             "inference_active",
             return_value=(True, False, False, {"endpoint_samples": _endpoint_samples()}),
         ),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
         patch.object(monitor, "find_inner_pid", return_value=111),
         patch.object(monitor, "kill_inner", return_value=True),
     ):
         decision = monitor.handle_stall()
     assert decision.action == "kill"
     assert decision.pid == 111
+
+
+# -- process-tree live-work signal (TICKET-033 / TICKET-039 / 040) ----------
+
+
+def test_handle_stall_idle_live_child_waits(tmp_path: Path) -> None:
+    """TICKET-040: LLM idle (no movement, endpoint not generating) + a live
+    non-LLM child under the root -> WAIT (waiting on work, not wedged), with
+    the sample cmdlines in the evidence. The kill path is NOT reached."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=50),
+        patch.object(
+            monitor, "has_live_work", return_value=(True, ["bash -c 'validator'"])
+        ),
+        patch.object(monitor, "find_inner_pid", return_value=111) as mock_find,
+        patch.object(monitor, "kill_inner", return_value=True) as mock_kill,
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "wait"
+    assert decision.reason == "live work in process tree (waiting on work, not wedged)"
+    mock_find.assert_not_called()
+    mock_kill.assert_not_called()
+    # The sample cmdlines are recorded in the evidence / log payload.
+    assert decision.evidence["proctree"]["samples"] == ["bash -c 'validator'"]
+    entries = monitor.log.read_all()
+    wait_entries = [e for e in entries if e.event_type == "stall.wait"]
+    assert len(wait_entries) == 1
+    assert wait_entries[0].payload["proctree"]["samples"] == ["bash -c 'validator'"]
+    assert wait_entries[0].payload["proctree"]["root"] == 50
+
+
+def test_handle_stall_idle_bare_tree_no_movement_kills(tmp_path: Path) -> None:
+    """TICKET-040: LLM idle + bare tree (no live children) + no movement ->
+    existing KILL path unchanged."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=50),
+        patch.object(monitor, "has_live_work", return_value=(False, [])),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    assert decision.pid == 111
+    entries = monitor.log.read_all()
+    kill_entries = [e for e in entries if e.event_type == "stall.kill"]
+    assert len(kill_entries) == 1
+    assert kill_entries[0].payload["pid"] == 111
+
+
+def test_handle_stall_no_root_falls_through_to_kill(tmp_path: Path) -> None:
+    """TICKET-040: when the pipeline root cannot be resolved, the process-tree
+    gate is skipped and the existing KILL path runs unchanged."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "detect_stall", return_value=_stalled_result()),
+        patch.object(monitor, "any_socket_live", return_value=False),
+        patch.object(monitor, "movement_recent_fine", return_value=False),
+        patch.object(monitor, "inference_active", return_value=(False, False, False, {})),
+        patch.object(monitor, "_resolve_pipeline_root", return_value=None),
+        patch.object(monitor, "has_live_work", return_value=(True, ["bash"])) as mock_live,
+        patch.object(monitor, "find_inner_pid", return_value=111),
+        patch.object(monitor, "kill_inner", return_value=True),
+    ):
+        decision = monitor.handle_stall()
+    assert decision.action == "kill"
+    mock_live.assert_not_called()
+
+
+def test_has_live_work_delegates_to_proctree(tmp_path: Path) -> None:
+    """TICKET-040: the overridable has_live_work seam delegates to proctree."""
+    monitor = _make_monitor(tmp_path)
+    with patch.object(
+        monitor.proctree, "has_live_work", return_value=(True, ["gh pr list"])
+    ) as mock_pt:
+        is_live, samples = monitor.has_live_work(50)
+    assert is_live is True
+    assert samples == ["gh pr list"]
+    mock_pt.assert_called_once_with(50)
+
+
+def test_resolve_pipeline_root_prefers_run_py(tmp_path: Path) -> None:
+    """TICKET-040: _resolve_pipeline_root prefers the run.py PID."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_find_run_pid", return_value=50),
+        patch.object(monitor, "find_inner_pid", return_value=111) as mock_find,
+    ):
+        assert monitor._resolve_pipeline_root() == 50
+    mock_find.assert_not_called()
+
+
+def test_resolve_pipeline_root_falls_back_to_inner_pid(tmp_path: Path) -> None:
+    """TICKET-040: when run.py is not located, fall back to the deepest
+    inner-spoke marker match."""
+    monitor = _make_monitor(tmp_path)
+    with (
+        patch.object(monitor, "_find_run_pid", return_value=None),
+        patch.object(monitor, "find_inner_pid", return_value=111),
+    ):
+        assert monitor._resolve_pipeline_root() == 111
 
 
 def test_inference_active_returns_signal(tmp_path: Path) -> None:
