@@ -81,6 +81,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sentry.endpoint import EndpointProbe
 from sentry.sentrylog import SentryLog
 
 # Process patterns that identify a live driver (bash driver or python runner).
@@ -193,6 +194,14 @@ class StallMonitor:
         self.project_dir = Path(project_dir)
         self.stall_seconds = stall_seconds
         self.endpoints = tuple(endpoints)
+        # TICKET-036: inference-endpoint state signal (TICKET-032). Base
+        # URLs are derived from the socket ``endpoints`` (host:port) as
+        # http://host:port. No I/O happens here (EndpointProbe.__init__
+        # stores state only).
+        self.endpoint_probe = EndpointProbe(
+            tuple(f"http://{endpoint}" for endpoint in self.endpoints),
+            timeout=5.0,
+        )
         self.trajectories_dir = (
             Path(trajectories_dir)
             if trajectories_dir is not None
@@ -499,6 +508,56 @@ class StallMonitor:
                 return True
         return False
 
+    # -- inference-endpoint state signal (TICKET-032 / TICKET-036) -----------
+
+    def inference_active(self, sample_interval: float = 0.5) -> tuple[bool, bool, bool, dict]:
+        """Return the inference-endpoint state signal.
+
+        Returns ``(requests_processing_positive, generating, blind, evidence)``:
+
+        * ``requests_processing_positive``: True when any endpoint reports
+          ``requests_processing > 0`` (a request is in flight).
+        * ``generating``: True when a generation counter advanced between the
+          two samples (TICKET-035) — the inference is actually advancing.
+        * ``blind``: True when no endpoint is reachable, OR every reachable
+          endpoint has ``requests_processing`` None (``/metrics`` unsupported,
+          so the endpoint is up but blind to inference state).
+        * ``evidence``: the two ``probe()`` samples (for the log payload).
+
+        Takes two ``self.endpoint_probe.probe()`` samples with ``self._sleep``
+        between them (the sampling is owned here, mirroring
+        ``movement_recent_fine``); the pure comparison is
+        ``EndpointProbe.generating``.
+        """
+        first = self.endpoint_probe.probe()
+        self._sleep(sample_interval)
+        second = self.endpoint_probe.probe()
+        samples = (first, second)
+
+        requests_processing_positive = False
+        for entry in first.values():
+            if not isinstance(entry, dict):
+                continue
+            rp = entry.get("requests_processing")
+            if isinstance(rp, float) and rp > 0:
+                requests_processing_positive = True
+                break
+        generating = self.endpoint_probe.generating(samples)
+
+        reachable = [
+            entry for entry in first.values()
+            if isinstance(entry, dict) and entry.get("reachable")
+        ]
+        if not reachable:
+            blind = True
+        else:
+            blind = all(
+                entry.get("requests_processing") is None for entry in reachable
+            )
+
+        evidence = {"endpoint_samples": samples}
+        return requests_processing_positive, generating, blind, evidence
+
     # -- process scan / kill ------------------------------------------------
 
     def _scan_processes(self) -> list[tuple[int, str]]:
@@ -751,6 +810,50 @@ class StallMonitor:
                 evidence=evidence,
                 logged=True,
             )
+        # TICKET-036: inference-endpoint state signal (TICKET-032). A
+        # healthy-slow inference (a request in flight AND the generation
+        # counters advancing) is WAIT, not a wedge. A blind endpoint
+        # (unreachable, or /metrics unsupported so requests_processing is
+        # None) must NOT be treated as wedged on that basis alone: prefer
+        # WAIT/none over KILL so a probe outage cannot masquerade as a wedge.
+        requests_processing_positive, generating, blind, endpoint_evidence = (
+            self.inference_active()
+        )
+        evidence.update(endpoint_evidence)
+        if requests_processing_positive and generating:
+            self.log.append(
+                "stall.wait",
+                {
+                    "reason": "inference active + generating (healthy-slow)",
+                    "socket_live": socket_live,
+                    "endpoint": endpoint_evidence,
+                    "last_movement": result.last_movement,
+                    "age_seconds": result.age_seconds,
+                },
+            )
+            return StallDecision(
+                action="wait",
+                reason="inference active + generating (healthy-slow)",
+                evidence=evidence,
+                logged=True,
+            )
+        if blind:
+            self.log.append(
+                "stall.wait",
+                {
+                    "reason": "endpoint blind - cannot confirm wedged",
+                    "socket_live": socket_live,
+                    "endpoint": endpoint_evidence,
+                    "last_movement": result.last_movement,
+                    "age_seconds": result.age_seconds,
+                },
+            )
+            return StallDecision(
+                action="none",
+                reason="endpoint blind - cannot confirm wedged",
+                evidence=evidence,
+                logged=True,
+            )
         pid = self.find_inner_pid()
         if pid is None:
             self.log.append(
@@ -764,7 +867,7 @@ class StallMonitor:
             return StallDecision(
                 action="none",
                 reason="stalled but no inner pid found",
-                evidence=dict(result.evidence),
+                evidence=evidence,
                 logged=True,
             )
         killed = self.kill_inner(pid)
@@ -782,7 +885,7 @@ class StallMonitor:
                 action="kill",
                 reason=result.reason,
                 pid=pid,
-                evidence=dict(result.evidence),
+                evidence=evidence,
                 logged=True,
             )
         self.log.append(
@@ -797,6 +900,6 @@ class StallMonitor:
             action="none",
             reason=result.reason,
             pid=pid,
-            evidence=dict(result.evidence),
+            evidence=evidence,
             logged=True,
         )
